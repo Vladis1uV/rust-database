@@ -1,4 +1,4 @@
-use bytes::BytesMut;
+use bytes::{BytesMut, Bytes};
 use tokio_util::codec::{Decoder, Encoder};
 
 use super::Frame;
@@ -23,12 +23,8 @@ pub enum RespError {
     Io(#[from] std::io::Error),
 }
 
-/// Redis's default `proto-max-bulk-len` is 512 MiB.
 const DEFAULT_MAX_BULK_LEN: usize = 512 * 1024 * 1024;
-/// Redis caps multibulk length at `i32::MAX`.
 const DEFAULT_MAX_ARRAY_LEN: usize = i32::MAX as usize;
-/// Clients only send flat arrays, so deep nesting means abuse. Without a cap,
-/// `*1\r\n*1\r\n*1\r\n...` would overflow the stack in a recursive parser.
 const DEFAULT_MAX_DEPTH: usize = 32;
 
 /// RESP2 codec for use with `tokio_util::codec::Framed`.
@@ -69,6 +65,23 @@ const DEFAULT_MAX_DEPTH: usize = 32;
 /// Re-parsing from scratch on every `Ok(None)` makes a large frame that
 /// arrives in many small reads O(n²). That's fine for now; we'll measure it
 /// with criterion in M9 before deciding whether to optimize.
+
+fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
+    buf.get(from..)?.windows(2).position(|w| w == b"\r\n").map(|i| from+i)
+}
+
+fn protocol(msg: &str) -> RespError {
+    return RespError::Protocol(String::from(msg));
+}
+
+fn read_line(buf: &[u8], from: usize) -> Option<(&[u8], usize)> {
+    return if let Some(cur) = find_crlf(buf, from) {
+        Some((&buf[from..cur], cur+2))
+    } else{
+        None
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RespCodec {
     max_bulk_len: usize,
@@ -99,6 +112,116 @@ impl RespCodec {
         self.max_depth = n;
         self
     }
+
+    pub fn parse_int(line: &[u8]) -> Result<i64, RespError> {
+        let text  = std::str::from_utf8(line)
+            .map_err(|_| protocol("Invalid line length"))?;
+
+        return text.parse::<i64>().map_err(|_| protocol("Invalid i64 in text"));
+    }
+
+    fn parse(&self, buf: &[u8], pos: usize, depth: usize) -> Result<Option<(Frame, usize)>, RespError> {
+        if depth > self.max_depth {
+            return Err(protocol("too deep recursion"));
+        } else {
+            let Some(&kind) = buf.get(pos) else {
+                return Ok(None);
+            };
+            match kind {
+                b'+' => {
+                    let Some((line, next)) = read_line(buf, pos+1) else {
+                        return Ok(None);
+                    };
+                    let text = std::str::from_utf8(line)
+                        .map_err(|_| protocol("Invalide from_utf8 operation"))?;
+                    
+                    return Ok(Some((Frame::Simple(String::from(text)), next)));
+                },
+                b'-' => {
+                    let Some((line, next)) = read_line(buf, pos+1) else {
+                        return Ok(None);
+                    };
+                    let text = std::str::from_utf8(line)
+                        .map_err(|_| protocol("Invalide from_utf8 operation"))?;
+
+                    return Ok(Some((Frame::Error(String::from(text)), next)));
+                },
+                b':' => {
+                    let Some((line, next)) = read_line(buf, pos+1) else {
+                        return Ok(None);
+                    };
+                    let number = Self::parse_int(line)
+                        .map_err(|_| protocol("Invalid parse_int operation"))?;
+
+                    return Ok(Some((Frame::Integer(number), next)));
+                },
+                b'$' => {
+                    let Some((line, data_start)) = read_line(buf, pos+1) else {
+                        return Ok(None);
+                    };
+                    let len = Self::parse_int(line)
+                        .map_err(|_| protocol("Invalid parse_int operation"))?;
+                    
+                    if len == -1 {
+                        return Ok(Some((Frame::Null, data_start)));
+                    }
+
+                    let len = usize::try_from(len)
+                        .map_err(|_| protocol("Invalid i64 -> usize convertion operation"))?;
+
+                    if len > self.max_bulk_len {
+                        return Err(protocol("Bulk length greater then max_bulk_len parameter"));
+                    }
+
+                    let data_end = data_start + len;
+                    let frame_end = data_end+2;
+
+                    if buf.len() < frame_end {
+                        return Ok(None);
+                    }
+
+                    if &buf[data_end..frame_end] != b"\r\n" {
+                        return Err(protocol("Bulk doesn't end with the crlf"));
+                    }
+
+                    return Ok(Some((Frame::Bulk(Bytes::copy_from_slice(&buf[data_start..data_end])), frame_end)))
+                },
+                b'*' => {
+                    let Some((line, mut next)) = read_line(buf, pos+1) else {
+                        return Ok(None);
+                    };
+                    let array_size = Self::parse_int(line)
+                        .map_err(|_| protocol("Invalid array size"))?;
+
+                    if array_size == -1 {
+                        return Ok(Some((Frame::NullArray, next)));
+                    }
+
+                    let array_size = usize::try_from(array_size)
+                        .map_err(|_| protocol("Invalid i64 -> usize convertion operation"))?;
+
+                    if array_size > self.max_array_len {
+                        return Err(protocol("Array length exceeded"));
+                    }
+
+                    let mut items = Vec::new();
+
+                    for _ in 0..array_size {
+                        let Some((frame, end)) = self.parse(buf, next, depth+1)? else {
+                            return Ok(None)
+                        };
+                        items.push(frame);
+                        next = end;
+                    }
+                    
+                    return Ok(Some((Frame::Array(items),next)));
+                },
+                other =>  Err(protocol(&format!("unknown type byte {:?}", other as char)))
+            }
+        }
+
+    }
+
 }
 
 impl Default for RespCodec {
@@ -111,9 +234,9 @@ impl Decoder for RespCodec {
     type Item = Frame;
     type Error = RespError;
 
-    #[allow(unused_variables)] // TODO(M1): remove once implemented
+    #[allow(unused_variables)]
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Frame>, RespError> {
-        todo!("M1: parse one frame from `src`; see the type-level docs")
+        todo!("M1: parse one frame from `src`; see the type-level docs");
     }
 }
 
