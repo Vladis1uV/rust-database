@@ -1,4 +1,4 @@
-use bytes::{BytesMut, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use super::Frame;
@@ -132,6 +132,11 @@ impl RespCodec {
                     let Some((line, next)) = read_line(buf, pos+1) else {
                         return Ok(None);
                     };
+
+                    if line.contains(&b'\n') {
+                        return Err(protocol("The simple string contains invalid character"));
+                    } 
+
                     let text = std::str::from_utf8(line)
                         .map_err(|_| protocol("Invalide from_utf8 operation"))?;
                     
@@ -141,6 +146,11 @@ impl RespCodec {
                     let Some((line, next)) = read_line(buf, pos+1) else {
                         return Ok(None);
                     };
+
+                    if line.contains(&b'\n') {
+                        return Err(protocol("The error line contains invalid character"));
+                    } 
+
                     let text = std::str::from_utf8(line)
                         .map_err(|_| protocol("Invalide from_utf8 operation"))?;
 
@@ -234,9 +244,12 @@ impl Decoder for RespCodec {
     type Item = Frame;
     type Error = RespError;
 
-    #[allow(unused_variables)]
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Frame>, RespError> {
-        todo!("M1: parse one frame from `src`; see the type-level docs");
+        let Some((frame, next)) = self.parse(src, 0, 0)? else {
+            return Ok(None);
+        };
+        src.advance(next);
+        Ok(Some(frame))
     }
 }
 
