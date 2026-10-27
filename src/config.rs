@@ -1,5 +1,5 @@
-use std::net::IpAddr;
 use clap::Parser;
+use std::net::IpAddr;
 
 /// Server configuration. Flag names follow `redis.conf` directives where one
 /// exists, so they look familiar to Redis users.

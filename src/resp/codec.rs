@@ -1,4 +1,4 @@
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use super::Frame;
@@ -67,17 +67,20 @@ const DEFAULT_MAX_DEPTH: usize = 32;
 /// with criterion in M9 before deciding whether to optimize.
 
 fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
-    buf.get(from..)?.windows(2).position(|w| w == b"\r\n").map(|i| from+i)
+    buf.get(from..)?
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .map(|i| from + i)
 }
 
 fn protocol(msg: &str) -> RespError {
-    return RespError::Protocol(String::from(msg));
+    RespError::Protocol(String::from(msg))
 }
 
 fn read_line(buf: &[u8], from: usize) -> Option<(&[u8], usize)> {
-    return if let Some(cur) = find_crlf(buf, from) {
-        Some((&buf[from..cur], cur+2))
-    } else{
+    if let Some(cur) = find_crlf(buf, from) {
+        Some((&buf[from..cur], cur + 2))
+    } else {
         None
     }
 }
@@ -114,64 +117,69 @@ impl RespCodec {
     }
 
     pub fn parse_int(line: &[u8]) -> Result<i64, RespError> {
-        let text  = std::str::from_utf8(line)
-            .map_err(|_| protocol("Invalid line length"))?;
+        let text = std::str::from_utf8(line).map_err(|_| protocol("Invalid line length"))?;
 
-        return text.parse::<i64>().map_err(|_| protocol("Invalid i64 in text"));
+        text.parse::<i64>()
+            .map_err(|_| protocol("Invalid i64 in text"))
     }
 
-    fn parse(&self, buf: &[u8], pos: usize, depth: usize) -> Result<Option<(Frame, usize)>, RespError> {
+    fn parse(
+        &self,
+        buf: &[u8],
+        pos: usize,
+        depth: usize,
+    ) -> Result<Option<(Frame, usize)>, RespError> {
         if depth > self.max_depth {
-            return Err(protocol("too deep recursion"));
+            Err(protocol("too deep recursion"))
         } else {
             let Some(&kind) = buf.get(pos) else {
                 return Ok(None);
             };
             match kind {
                 b'+' => {
-                    let Some((line, next)) = read_line(buf, pos+1) else {
+                    let Some((line, next)) = read_line(buf, pos + 1) else {
                         return Ok(None);
                     };
 
                     if line.contains(&b'\n') {
                         return Err(protocol("The simple string contains invalid character"));
-                    } 
+                    }
 
                     let text = std::str::from_utf8(line)
                         .map_err(|_| protocol("Invalide from_utf8 operation"))?;
-                    
-                    return Ok(Some((Frame::Simple(String::from(text)), next)));
-                },
+
+                    Ok(Some((Frame::Simple(String::from(text)), next)))
+                }
                 b'-' => {
-                    let Some((line, next)) = read_line(buf, pos+1) else {
+                    let Some((line, next)) = read_line(buf, pos + 1) else {
                         return Ok(None);
                     };
 
                     if line.contains(&b'\n') {
                         return Err(protocol("The error line contains invalid character"));
-                    } 
+                    }
 
                     let text = std::str::from_utf8(line)
                         .map_err(|_| protocol("Invalide from_utf8 operation"))?;
 
-                    return Ok(Some((Frame::Error(String::from(text)), next)));
-                },
+                    Ok(Some((Frame::Error(String::from(text)), next)))
+                }
                 b':' => {
-                    let Some((line, next)) = read_line(buf, pos+1) else {
+                    let Some((line, next)) = read_line(buf, pos + 1) else {
                         return Ok(None);
                     };
                     let number = Self::parse_int(line)
-                        .map_err(|_| protocol("Invalid parse_int operation"))?;
+                        .map_err(|_| protocol("Invalid parse_int operation in Integer Variant"))?;
 
-                    return Ok(Some((Frame::Integer(number), next)));
-                },
+                    Ok(Some((Frame::Integer(number), next)))
+                }
                 b'$' => {
-                    let Some((line, data_start)) = read_line(buf, pos+1) else {
+                    let Some((line, data_start)) = read_line(buf, pos + 1) else {
                         return Ok(None);
                     };
                     let len = Self::parse_int(line)
-                        .map_err(|_| protocol("Invalid parse_int operation"))?;
-                    
+                        .map_err(|_| protocol("Invalid parse_int operation in Bulk Variant"))?;
+
                     if len == -1 {
                         return Ok(Some((Frame::Null, data_start)));
                     }
@@ -184,7 +192,7 @@ impl RespCodec {
                     }
 
                     let data_end = data_start + len;
-                    let frame_end = data_end+2;
+                    let frame_end = data_end + 2;
 
                     if buf.len() < frame_end {
                         return Ok(None);
@@ -194,14 +202,17 @@ impl RespCodec {
                         return Err(protocol("Bulk doesn't end with the crlf"));
                     }
 
-                    return Ok(Some((Frame::Bulk(Bytes::copy_from_slice(&buf[data_start..data_end])), frame_end)))
-                },
+                    Ok(Some((
+                        Frame::Bulk(Bytes::copy_from_slice(&buf[data_start..data_end])),
+                        frame_end,
+                    )))
+                }
                 b'*' => {
-                    let Some((line, mut next)) = read_line(buf, pos+1) else {
+                    let Some((line, mut next)) = read_line(buf, pos + 1) else {
                         return Ok(None);
                     };
-                    let array_size = Self::parse_int(line)
-                        .map_err(|_| protocol("Invalid array size"))?;
+                    let array_size =
+                        Self::parse_int(line).map_err(|_| protocol("Invalid array size"))?;
 
                     if array_size == -1 {
                         return Ok(Some((Frame::NullArray, next)));
@@ -217,21 +228,19 @@ impl RespCodec {
                     let mut items = Vec::new();
 
                     for _ in 0..array_size {
-                        let Some((frame, end)) = self.parse(buf, next, depth+1)? else {
-                            return Ok(None)
+                        let Some((frame, end)) = self.parse(buf, next, depth + 1)? else {
+                            return Ok(None);
                         };
                         items.push(frame);
                         next = end;
                     }
-                    
-                    return Ok(Some((Frame::Array(items),next)));
-                },
-                other =>  Err(protocol(&format!("unknown type byte {:?}", other as char)))
+
+                    Ok(Some((Frame::Array(items), next)))
+                }
+                other => Err(protocol(&format!("unknown type byte {:?}", other as char))),
             }
         }
-
     }
-
 }
 
 impl Default for RespCodec {
@@ -256,9 +265,46 @@ impl Decoder for RespCodec {
 impl Encoder<Frame> for RespCodec {
     type Error = RespError;
 
-    #[allow(unused_variables)] // TODO(M1): remove once implemented
     fn encode(&mut self, frame: Frame, dst: &mut BytesMut) -> Result<(), RespError> {
-        todo!("M1: write `frame` to `dst` in wire format")
+        match frame {
+            Frame::Simple(line) => {
+                dst.put_u8(b'+');
+                dst.put_slice(line.as_bytes());
+                dst.put_slice(b"\r\n");
+            }
+            Frame::Error(line) => {
+                dst.put_u8(b'-');
+                dst.put_slice(line.as_bytes());
+                dst.put_slice(b"\r\n");
+            }
+            Frame::Integer(number) => {
+                dst.put_u8(b':');
+                dst.put_slice(number.to_string().as_bytes());
+                dst.put_slice(b"\r\n");
+            }
+            Frame::Bulk(bytes) => {
+                dst.put_u8(b'$');
+                dst.put_slice(bytes.len().to_string().as_bytes());
+                dst.put_slice(b"\r\n");
+                dst.put_slice(&bytes);
+                dst.put_slice(b"\r\n");
+            }
+            Frame::Array(array) => {
+                dst.put_u8(b'*');
+                dst.put_slice(array.len().to_string().as_bytes());
+                dst.put_slice(b"\r\n");
+                for fr in array {
+                    self.encode(fr, dst)?;
+                }
+            }
+            Frame::Null => {
+                dst.put_slice("$-1\r\n".as_bytes());
+            }
+            Frame::NullArray => {
+                dst.put_slice("*-1\r\n".as_bytes());
+            }
+        }
+        Ok(())
     }
 }
 
